@@ -1,0 +1,198 @@
+# =============================================================================
+# PINN for the 1D quantum BEC droplet — master config
+# =============================================================================
+#
+# This file drives a single experiment. Run with:
+#
+#     python run_experiment.py --config config.yaml
+#
+# To run an experiment sweep, duplicate this file (e.g., config_exp2.yaml)
+# and change the fields of interest + the `experiment.name` field so outputs
+# don't collide.
+#
+# Every field has a comment explaining *what* it does and *why* the default
+# was chosen. Fields marked [PRIMARY] are the ones we expect to vary across
+# experiments; fields marked [FIXED] should stay constant for apples-to-apples
+# comparisons unless you're explicitly ablating them.
+# =============================================================================
+
+experiment:
+  # Human-readable tag that determines the output folder: results/<name>/
+  name: "exp06_full_profile"
+  # Free-form notes that will be copied into the results folder alongside
+  # the metrics, so the experiment is self-documenting.
+  notes: |
+    Full-profile uniqueness: instead of a handful of scalar anchors, the
+    complete analytical psi(x) profile is provided on a dense x-grid for
+    each mu in mu_anchor_full. This pins the entire droplet shape at those
+    mu values, giving much stronger uniqueness than multi-point anchors.
+    Previous exp05 (5 scalar anchors) had residual shape error especially
+    at small |mu| (wide droplets). Full profiles fix that at the cost of
+    using more analytical information per supervised mu.
+
+# ------------------------------- Problem -------------------------------------
+problem:
+  # Spatial half-domain. [FIXED initially, vary in the "domain" ablation.]
+  # Rationale: the droplet width is 1/k = 1/sqrt(2|mu|), which at |mu|=0.02
+  # gives ~5. We want ~5-6x the width to capture the exponential tails
+  # without wasting network capacity on near-zero regions.
+  L: 30.0
+
+  # Range of chemical potentials the network is trained on. [PRIMARY axis.]
+  # Valid range for PA solution: mu in (-2/9, 0) = (-0.2222..., 0).
+  # We stay strictly inside:
+  #   - mu_max=-0.02 avoids the NLSE-soliton limit where the droplet width
+  #     diverges (would need larger L).
+  #   - mu_min=-0.22 pushes into the flat-top regime (B = sqrt(1-9|mu|/2)
+  #     -> 0.1 at |mu|=0.22, still numerically well-conditioned).
+  mu_min: -0.22
+  mu_max: -0.02
+
+# ------------------------------- Network -------------------------------------
+network:
+  # Depth = number of hidden layers. [SECONDARY — part of the arch ablation.]
+  # 5 layers is the standard Raissi-PINN choice; deep enough for a
+  # soliton-like function, shallow enough to optimize cleanly with L-BFGS.
+  depth: 5
+
+  # Hidden width. [SECONDARY — part of the arch ablation.]
+  # 64 is a modest baseline; the typical soliton PINN literature uses 50-100.
+  width: 64
+
+  # Activation function. [FIXED.]
+  # "tanh" is the default for PINNs because psi_xx requires smooth 2nd derivs
+  # and tanh is C^infty. "gelu"/"silu" are options for the ablation.
+  activation: "tanh"
+
+# ------------------------------- Collocation --------------------------------
+collocation:
+  # Interior PDE collocation points per training iteration. [SECONDARY.]
+  # 4000 is a good mid-range for 1D problems — enough to resolve the droplet
+  # core without making Adam slow. L-BFGS phase uses 2x this (see code).
+  n_collocation: 4000
+
+  # Number of distinct mu values sampled each time we resample. [SECONDARY.]
+  # Too few and the network memorizes a handful of solutions; too many
+  # and gradient signal per-mu gets noisy. 32 balances coverage vs noise.
+  n_mu_train: 32
+
+  # Boundary points (equally split +L and -L). [FIXED.]
+  # Only the mu dimension needs sampling; x is already pinned.
+  n_boundary: 64
+
+  # Redraw collocation points every N iterations. [FIXED.]
+  # Prevents overfitting to a fixed point cloud; standard PINN practice.
+  resample_every: 500
+
+# ------------------------------- Uniqueness ---------------------------------
+uniqueness:
+  # [PRIMARY] — this is the main ablation axis.
+  # Options:
+  #   "norm"             -- match integral |psi|^2 dx to N(mu) from PA eq.(10)
+  #   "anchor"           -- pin psi(0, mu) to its analytical value
+  #   "semi_supervised"  -- add a small sup. dataset of (x,mu,psi_exact)
+  #   "norm_plus_anchor" -- NORM + analytical shape anchors. Multiple
+  #                         analytical scalar constraints per mu.
+  #   "full_profile"     -- provide the complete psi(x) profile on a dense
+  #                         x-grid for each mu in mu_anchor_full. Much
+  #                         stronger than scalar anchors: the entire droplet
+  #                         shape is pinned at those mu values.
+  #   "none"             -- no uniqueness term (expected to collapse to psi=0!)
+  method: "full_profile"
+
+  # Only when method == "full_profile": mu values at which the complete
+  # analytical psi(x) profile is given as supervision. Choose values spread
+  # across the training range to cover different droplet widths. All must
+  # lie strictly inside (-2/9, 0) = (-0.2222, 0).
+  mu_anchor_full: [-0.04, -0.08, -0.12, -0.16, -0.20]
+
+  # x-grid density for the full-profile supervision.
+  # 401 points over [-L, L] (~0.15 spacing for L=30) resolves the droplet
+  # core and tails well. Increase if you see tail artifacts.
+  n_x_anchor_full: 401
+
+  # Only when method == "norm" or "norm_plus_anchor": choice of norm-matching.
+  norm_loss_type: "relative"
+
+  # Only when method == "norm_plus_anchor": anchor x-positions in units of
+  # 1/k(mu). Kept here for reference; not used by full_profile.
+  anchor_x_list: [0.0, 1.0, -1.0, 2.5, -2.5]
+
+  # Relative weight of the anchor block inside the norm_plus_anchor hybrid.
+  anchor_weight_in_hybrid: 100.0
+
+  # Only used when method == "semi_supervised".
+  n_supervised_points: 100
+
+  # Only used when method == "anchor".
+  anchor_x: 0.0
+
+# ------------------------------- Loss weights --------------------------------
+loss_weights:
+  # [SECONDARY — part of the loss-weighting ablation.]
+  # These defaults come from empirical tuning for the norm_plus_anchor setup:
+  #   - w_pde=100 makes the PDE residual competitive with the uniqueness loss.
+  #     Without this, the network can satisfy norm+anchor while violating the
+  #     PDE on fine length scales (the "right norm, wrong shape" failure).
+  #   - w_uniq=1 (reduced from the initial 10) because anchor_weight_in_hybrid
+  #     already bakes in a large internal weight for the anchor block.
+  #   - w_bc=10 unchanged -- standard PINN uplift for soft Dirichlet.
+  # For a norm-only or anchor-only ablation, reset these to 1 / 10 / 10.
+  w_pde: 50.0
+  w_bc: 10.0
+  w_uniq: 1.0
+
+# ------------------------------- Optimization --------------------------------
+optimization:
+  # Adam warmup iterations. [FIXED — part of the 2-phase Raissi recipe.]
+  # 20k iters is usually enough for the loss to plateau before L-BFGS.
+  adam_iters: 20000
+  adam_lr: 1.0e-3                 # standard PINN LR
+  adam_lr_final: 1.0e-5           # cosine-decay target
+
+  # L-BFGS refinement. [FIXED.]
+  # The workhorse for polishing PINNs to high precision. `max_iter` is a
+  # hard cap; it will stop earlier when tolerances are met.
+  lbfgs_iters: 50000
+  lbfgs_history: 50               # memory size of L-BFGS
+  lbfgs_tol_grad: 1.0e-9
+  lbfgs_tol_change: 1.0e-12
+
+# ------------------------------- Misc ----------------------------------------
+misc:
+  # [PRIMARY for robustness runs — run ≥3 seeds for the headline metric.]
+  seed: 0
+
+  # Print frequency (iterations).
+  log_every: 500
+
+  # "cuda" or "cpu". Falls back to CPU if no GPU present.
+  device: "cuda"
+
+# ------------------------------- Evaluation ---------------------------------
+evaluation:
+  # mu values at which we report metrics + plot profiles. [FIXED grid.]
+  # 10 values spanning the training range to see generalization vs. mu,
+  # including -0.22 which sits in the flat-top regime (|mu| ~ 2/9).
+  mu_eval: [-0.02, -0.04, -0.06, -0.08, -0.10, -0.13, -0.16, -0.19, -0.21, -0.22]
+
+  # Number of x points used on the eval grid (dense for accurate L2).
+  n_x_eval: 2001
+
+  # ------- Train vs test profile plot (new) -------
+  # mu values INSIDE the training range to showcase in the "train" row.
+  # These are in-distribution for the (x,mu) network.
+  mu_train_plot: [-0.05, -0.10, -0.15, -0.20]
+  # mu values OUTSIDE the training range to test extrapolation.
+  # Note: stay inside the valid range (-2/9, 0) = (-0.2222, 0).
+  # Below mu_min: closer to flat-top. Above mu_max: toward NLSE-soliton.
+  mu_test_plot: [-0.015, -0.222]
+
+  # ------- Error heatmap (new) -------
+  # Grid resolution for the pointwise-error heatmap.
+  n_mu_heatmap: 80
+  n_x_heatmap: 401
+  # Optional: extend heatmap mu axis beyond [mu_min, mu_max] to visualize OOD.
+  # null = use training range. Set e.g. -0.222 / -0.005 to show extrapolation.
+  mu_min_heatmap: null
+  mu_max_heatmap: null
